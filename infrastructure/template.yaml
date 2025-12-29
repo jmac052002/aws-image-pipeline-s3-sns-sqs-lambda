@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Event-driven image processing pipeline (S3 -> Lambda -> SNS -> SQS -> Lambda)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+
+Resources:
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FanoutTopic:
+    Type: AWS::SNS::Topic
+
+  WorkerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  WorkerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WorkerDLQ.Arn
+        maxReceiveCount: 3
+
+  TopicToQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref FanoutTopic
+      Protocol: sqs
+      Endpoint: !GetAtt WorkerQueue.Arn
+      RawMessageDelivery: true
+
+  AllowSnsToSendToSqsPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref WorkerQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSNSPublish
+            Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt WorkerQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref FanoutTopic
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/ingest/
+      Handler: app.lambda_handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref UploadBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt FanoutTopic.TopicName
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref FanoutTopic
+          UPLOAD_BUCKET: !Ref UploadBucket
+
+  # IMPORTANT: Permission must exist before S3 can invoke the function
+  IngestFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IngestFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt UploadBucket.Arn
+
+  # IMPORTANT: Explicit notification resource breaks SAM circular dependency
+  UploadBucketNotification:
+    Type: AWS::S3::BucketNotification
+    DependsOn:
+      - IngestFunctionPermission
+    Properties:
+      Bucket: !Ref UploadBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt IngestFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpg
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/worker/
+      Handler: app.lambda_handler
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt WorkerQueue.QueueName
+        - S3WritePolicy:
+            BucketName: !Ref ProcessedBucket
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WorkerQueue.Arn
+            BatchSize: 5
+
+Outputs:
+  UploadBucketName:
+    Description: Bucket where images are uploaded (.jpg triggers pipeline)
+    Value: !Ref UploadBucket
+
+  ProcessedBucketName:
+    Description: Bucket where worker writes JSON results
+    Value: !Ref ProcessedBucket
+
+  TopicArn:
+    Description: SNS topic used for fanout
+    Value: !Ref FanoutTopic
+
+  QueueUrl:
+    Description: Primary worker SQS queue URL
+    Value: !Ref WorkerQueue
+
+  DLQUrl:
+    Description: Dead-letter queue URL
+    Value: !Ref WorkerDLQ
+
