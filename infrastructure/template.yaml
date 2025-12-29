@@ -13,13 +13,49 @@ Globals:
         LOG_LEVEL: INFO
 
 Resources:
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/ingest/
+      Handler: app.lambda_handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref UploadBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt FanoutTopic.TopicName
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref FanoutTopic
+          UPLOAD_BUCKET: !Ref UploadBucket
+
+  # Permission must exist before S3 can invoke the Lambda
+  IngestFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IngestFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt UploadBucket.Arn
+
+  # S3 bucket with notification configured (DependsOn breaks circular dependency)
   UploadBucket:
     Type: AWS::S3::Bucket
+    DependsOn:
+      - IngestFunctionPermission
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt IngestFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpg
 
   ProcessedBucket:
     Type: AWS::S3::Bucket
@@ -69,47 +105,6 @@ Resources:
             Condition:
               ArnEquals:
                 aws:SourceArn: !Ref FanoutTopic
-
-  IngestFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: ../src/ingest/
-      Handler: app.lambda_handler
-      Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref UploadBucket
-        - SNSPublishMessagePolicy:
-            TopicName: !GetAtt FanoutTopic.TopicName
-      Environment:
-        Variables:
-          TOPIC_ARN: !Ref FanoutTopic
-          UPLOAD_BUCKET: !Ref UploadBucket
-
-  # IMPORTANT: Permission must exist before S3 can invoke the function
-  IngestFunctionPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref IngestFunction
-      Principal: s3.amazonaws.com
-      SourceArn: !GetAtt UploadBucket.Arn
-
-  # IMPORTANT: Explicit notification resource breaks SAM circular dependency
-  UploadBucketNotification:
-    Type: AWS::S3::BucketNotification
-    DependsOn:
-      - IngestFunctionPermission
-    Properties:
-      Bucket: !Ref UploadBucket
-      NotificationConfiguration:
-        LambdaConfigurations:
-          - Event: s3:ObjectCreated:*
-            Function: !GetAtt IngestFunction.Arn
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: suffix
-                    Value: .jpg
 
   WorkerFunction:
     Type: AWS::Serverless::Function
