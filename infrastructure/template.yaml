@@ -19,8 +19,6 @@ Resources:
       CodeUri: ../src/ingest/
       Handler: app.lambda_handler
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref UploadBucket
         - SNSPublishMessagePolicy:
             TopicName: !GetAtt FanoutTopic.TopicName
       Environment:
@@ -35,7 +33,7 @@ Resources:
       Action: lambda:InvokeFunction
       FunctionName: !Ref IngestFunction
       Principal: s3.amazonaws.com
-      SourceArn: !GetAtt UploadBucket.Arn
+
 
   # S3 bucket with notification configured (DependsOn breaks circular dependency)
   UploadBucket:
