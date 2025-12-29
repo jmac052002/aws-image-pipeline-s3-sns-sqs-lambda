@@ -13,47 +13,16 @@ Globals:
         LOG_LEVEL: INFO
 
 Resources:
-  IngestFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: ../src/ingest/
-      Handler: app.lambda_handler
-      Policies:
-        - SNSPublishMessagePolicy:
-            TopicName: !GetAtt FanoutTopic.TopicName
-      Environment:
-        Variables:
-          TOPIC_ARN: !Ref FanoutTopic
-          UPLOAD_BUCKET: !Ref UploadBucket
-
-  # Permission must exist before S3 can invoke the Lambda
-  IngestFunctionPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref IngestFunction
-      Principal: s3.amazonaws.com
-
-
-  # S3 bucket with notification configured (DependsOn breaks circular dependency)
+  # -------------------------
+  # Core buckets
+  # -------------------------
   UploadBucket:
     Type: AWS::S3::Bucket
-    DependsOn:
-      - IngestFunctionPermission
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
-      NotificationConfiguration:
-        LambdaConfigurations:
-          - Event: s3:ObjectCreated:*
-            Function: !GetAtt IngestFunction.Arn
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: suffix
-                    Value: .jpg
 
   ProcessedBucket:
     Type: AWS::S3::Bucket
@@ -63,6 +32,9 @@ Resources:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
 
+  # -------------------------
+  # Messaging (SNS -> SQS + DLQ)
+  # -------------------------
   FanoutTopic:
     Type: AWS::SNS::Topic
 
@@ -104,6 +76,25 @@ Resources:
               ArnEquals:
                 aws:SourceArn: !Ref FanoutTopic
 
+  # -------------------------
+  # Ingest Lambda (S3 -> SNS)
+  # -------------------------
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/ingest/
+      Handler: app.lambda_handler
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt FanoutTopic.TopicName
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref FanoutTopic
+          UPLOAD_BUCKET: !Ref UploadBucket
+
+  # -------------------------
+  # Worker Lambda (SQS -> S3)
+  # -------------------------
   WorkerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -123,6 +114,144 @@ Resources:
           Properties:
             Queue: !GetAtt WorkerQueue.Arn
             BatchSize: 5
+
+  # -------------------------
+  # Custom Resource Lambda (Configurator)
+  # Configures S3 notification AFTER resources exist
+  # -------------------------
+  S3NotificationConfiguratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3NotificationConfiguratorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotificationConfiguration
+                  - s3:GetBucketNotificationConfiguration
+                Resource: !Sub arn:aws:s3:::${UploadBucket}
+              - Effect: Allow
+                Action:
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                Resource: !GetAtt IngestFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  S3NotificationConfiguratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt S3NotificationConfiguratorRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+
+          http = urllib3.PoolManager()
+          s3 = boto3.client("s3")
+          lam = boto3.client("lambda")
+
+          def send(event, context, status, data):
+              response_body = json.dumps({
+                  "Status": status,
+                  "Reason": f"See CloudWatch Logs: {context.log_stream_name}",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data,
+              })
+              http.request("PUT", event["ResponseURL"], body=response_body, headers={"content-type": ""})
+
+          def handler(event, context):
+              try:
+                  props = event["ResourceProperties"]
+                  bucket = props["BucketName"]
+                  function_arn = props["FunctionArn"]
+                  suffix = props.get("Suffix", ".jpg")
+                  statement_id = props.get("StatementId", "AllowS3Invoke")
+
+                  if event["RequestType"] in ("Create", "Update"):
+                      # Ensure Lambda permission exists (idempotent)
+                      try:
+                          lam.add_permission(
+                              FunctionName=function_arn,
+                              StatementId=statement_id,
+                              Action="lambda:InvokeFunction",
+                              Principal="s3.amazonaws.com",
+                              SourceArn=f"arn:aws:s3:::{bucket}",
+                          )
+                      except lam.exceptions.ResourceConflictException:
+                          pass
+
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={
+                              "LambdaFunctionConfigurations": [
+                                  {
+                                      "LambdaFunctionArn": function_arn,
+                                      "Events": ["s3:ObjectCreated:*"],
+                                      "Filter": {
+                                          "Key": {
+                                              "FilterRules": [
+                                                  {"Name": "suffix", "Value": suffix}
+                                              ]
+                                          }
+                                      },
+                                  }
+                              ]
+                          },
+                      )
+                      send(event, context, "SUCCESS", {"Bucket": bucket, "Configured": True})
+                      return
+
+                  if event["RequestType"] == "Delete":
+                      # Remove all notifications
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={}
+                      )
+                      # Best-effort remove permission
+                      try:
+                          lam.remove_permission(FunctionName=function_arn, StatementId=statement_id)
+                      except Exception:
+                          pass
+
+                      send(event, context, "SUCCESS", {"Bucket": bucket, "Deleted": True})
+                      return
+
+              except Exception as e:
+                  send(event, context, "FAILED", {"Error": str(e)})
+
+  ConfigureUploadBucketNotifications:
+    Type: Custom::S3Notification
+    DependsOn:
+      - UploadBucket
+      - IngestFunction
+      - S3NotificationConfiguratorFunction
+    Properties:
+      ServiceToken: !GetAtt S3NotificationConfiguratorFunction.Arn
+      BucketName: !Ref UploadBucket
+      FunctionArn: !GetAtt IngestFunction.Arn
+      Suffix: ".jpg"
+      StatementId: "AllowS3InvokeFromUploadBucket"
 
 Outputs:
   UploadBucketName:
