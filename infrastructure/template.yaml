@@ -138,7 +138,7 @@ Resources:
                 Action:
                   - s3:PutBucketNotificationConfiguration
                   - s3:GetBucketNotificationConfiguration
-                Resource: !Sub arn:aws:s3:::${UploadBucket}
+                Resource: "*"
               - Effect: Allow
                 Action:
                   - lambda:AddPermission
