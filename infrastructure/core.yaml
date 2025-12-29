@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Core infrastructure for image processing pipeline
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+
+Resources:
+  UploadBucket:
+    Type: AWS::S3::Bucket
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+
+  FanoutTopic:
+    Type: AWS::SNS::Topic
+
+  WorkerDLQ:
+    Type: AWS::SQS::Queue
+
+  WorkerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WorkerDLQ.Arn
+        maxReceiveCount: 3
+
+  AllowSnsToSendToSqs:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref WorkerQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt WorkerQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref FanoutTopic
+
+  TopicToQueue:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref FanoutTopic
+      Protocol: sqs
+      Endpoint: !GetAtt WorkerQueue.Arn
+      RawMessageDelivery: true
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/ingest/
+      Handler: app.lambda_handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref UploadBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt FanoutTopic.TopicName
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref FanoutTopic
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/worker/
+      Handler: app.lambda_handler
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WorkerQueue.Arn
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt WorkerQueue.QueueName
+        - S3WritePolicy:
+            BucketName: !Ref ProcessedBucket
+
+Outputs:
+  UploadBucket:
+    Value: !Ref UploadBucket
+  IngestFunctionArn:
+    Value: !GetAtt IngestFunction.Arn
